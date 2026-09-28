@@ -73,4 +73,18 @@ public class BacktestController {
     public ValuationResult valuation(@RequestParam long asOf, @RequestParam String baseCcy) {
         return engine.runTo(asOf, baseCcy);
     }
+
+    /** 查询某标的尚未售尽的成本批次（FIFO）。 */
+    @GetMapping("/positions/{symbol}/lots")
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.CostLot>
+            openLots(@PathVariable String symbol) {
+        return engine.openLots(symbol);
+    }
+
+    /** 查询某标的逐笔卖出的已实现盈亏明细（FIFO 批次消耗行）。 */
+    @GetMapping("/positions/{symbol}/realizations")
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.LotRealization>
+            realizations(@PathVariable String symbol) {
+        return engine.realizations(symbol);
+    }
 }

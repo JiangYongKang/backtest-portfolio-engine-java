@@ -241,6 +241,14 @@ public class BacktestEngine {
         if (!fillService.consume(fill)) {
             return; // 重复回报保护
         }
+        // 买入结算前，先把这笔实际支出从本单自己的预占中划出（释放等额预留），
+        // 使结算校验只面对“其他订单的预占”，避免大额单把自身预占误判成不可用。
+        if (order.getSide() == Side.BUY) {
+            BigDecimal gross = fill.price().multiply(fill.quantity())
+                    .setScale(portfolio.getConfig().moneyScale(), java.math.RoundingMode.HALF_UP);
+            BigDecimal out = gross.add(nz(fill.commission())).add(nz(fill.tax()));
+            chargeBuyReservation(order, out);
+        }
         portfolio.applyFill(fill, order.getCurrency());
         orderService.applyFill(order.getOrderId(), qty, fill.price(), t);
         lastMatchTime.put(order.getOrderId(), t);
@@ -251,6 +259,24 @@ public class BacktestEngine {
             recalibrateReservation(updated, t);
             log.debug("partial fill orderId={} filled={} remaining={}",
                     order.getOrderId(), updated.getFilledQty(), updated.remainingQty());
+        }
+    }
+
+    private static BigDecimal nz(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v;
+    }
+
+    /**
+     * 买入成交结算前，从本单预占台账划出等额预留（不超过台账余额）。
+     * 划出后该笔支出与预留等额抵消，其他订单的可用资金不受影响；
+     * 若实际支出超过台账（极端行情下市价单价格跳出估价），超出部分由结算按自由现金校验。
+     */
+    private void chargeBuyReservation(Order order, BigDecimal out) {
+        BigDecimal held = cashReservation.getOrDefault(order.getOrderId(), BigDecimal.ZERO);
+        BigDecimal covered = held.min(out);
+        if (covered.signum() > 0) {
+            releaseLedgerCash(order, covered);
+            cashReservation.put(order.getOrderId(), held.subtract(covered));
         }
     }
 
@@ -277,6 +303,12 @@ public class BacktestEngine {
                 .orElse(null);
     }
 
+    /**
+     * 买入最坏成本（足额预占）。
+     * 限价单用限价作为参考价，再按买入滑点上浮并计入佣金/税——成交价含滑点可能高于限价，
+     * 预占必须覆盖这部分上浮，否则部分成交续结算时可用资金会被滑点“挤爆”。
+     * 市价单用当刻可见参考价，滑点同理计入。
+     */
     private BigDecimal estimateCost(Order order, BigDecimal px) {
         var cb = fillService.computeCosts(order, order.getQuantity(), px);
         return cb.netCashFlow().abs();
@@ -299,9 +331,21 @@ public class BacktestEngine {
                 return; // 价格暂不可得，维持预占等待后续
             }
             BigDecimal need = estimateCost(order, px);
-            if (need.compareTo(held) < 0) {
+            int cmp = need.compareTo(held);
+            if (cmp < 0) {
+                // 剩余量最坏成本下降：释放差额。
                 releaseLedgerCash(order, held.subtract(need));
                 cashReservation.put(order.getOrderId(), need);
+            } else if (cmp > 0) {
+                // 剩余量最坏成本上升（如部分成交后按剩余重估、价格上浮）：补足差额；
+                // 可用资金不足时维持原预占（后续结算再做硬校验），不改变既有订单状态。
+                try {
+                    portfolio.reserveCash(order.getCurrency(), need.subtract(held));
+                    cashReservation.put(order.getOrderId(), need);
+                } catch (com.github.highcumontoa.backtestportfolioenginejava.exception.ApiException ex) {
+                    log.warn("top-up reservation failed orderId={} need={} held={}: {}",
+                            order.getOrderId(), need, held, ex.getCode());
+                }
             }
         } else {
             frozenReservation.put(order.getOrderId(), order.remainingQty());
@@ -362,5 +406,27 @@ public class BacktestEngine {
                 .orElseThrow(() -> new com.github.highcumontoa.backtestportfolioenginejava.exception
                         .InvalidArgumentApiException("ORDER_NOT_FOUND",
                         "unknown clientOrderId " + clientOrderId));
+    }
+
+    /** 指定标的尚未售尽的成本批次（FIFO 顺序），供按笔对账。 */
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.CostLot>
+            openLots(String symbol) {
+        return portfolio.lotService().openLots(symbol);
+    }
+
+    /** 指定标的全部卖出消耗与已实现盈亏明细（按发生顺序）。 */
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.LotRealization>
+            realizations(String symbol) {
+        return portfolio.lotService().realizations(symbol);
+    }
+
+    /** 指定币种累计已实现盈亏（费税已计入）。 */
+    public BigDecimal realizedPnl(String currency) {
+        return portfolio.lotService().realizedPnl(currency);
+    }
+
+    /** 指定币种累计现金分红收益。 */
+    public BigDecimal dividendIncome(String currency) {
+        return portfolio.lotService().dividendIncome(currency);
     }
 }

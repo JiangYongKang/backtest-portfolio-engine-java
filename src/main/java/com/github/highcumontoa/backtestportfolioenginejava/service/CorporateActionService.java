@@ -47,8 +47,8 @@ public class CorporateActionService {
             BigDecimal qty = p == null ? BigDecimal.ZERO : p.getQuantity();
             BigDecimal proceeds = qty.multiply(action.cashPerShare())
                     .setScale(portfolio.getConfig().moneyScale(), java.math.RoundingMode.HALF_UP);
-            // 直接派现（入账为内部公司行为，非外部入金）。
-            portfolio.deposit(action.currency(), proceeds);
+            // 直接派现（入账为内部公司行为，非外部入金），并计入当期分红收益，不改批次。
+            portfolio.payDividend(action.currency(), proceeds);
             log.info("corporate action CASH_DIVIDEND id={} symbol={} qty={} perShare={} proceeds={} {}",
                     action.id(), action.symbol(), qty, action.cashPerShare(), proceeds, action.currency());
             return true;
@@ -61,7 +61,7 @@ public class CorporateActionService {
         }
         BigDecimal beforeQty = p.getQuantity();
         BigDecimal beforeCost = p.totalCost();
-        p.applyRatio(action.ratio());
+        portfolio.applySplitRatio(action.symbol(), action.ratio());
         log.info("corporate action {} id={} symbol={} ratio={} qty {} -> {} totalCost {} -> {}",
                 action.type(), action.id(), action.symbol(), action.ratio(),
                 beforeQty, p.getQuantity(), beforeCost, p.totalCost());

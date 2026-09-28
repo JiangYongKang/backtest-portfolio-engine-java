@@ -15,8 +15,9 @@
 | `MatchingService` | 撮合判定（市价/限价、停牌、无价、价格穿越）与参考价、可成交量 |
 | `FillService` | 滑点/佣金/最低佣金/税的逐笔成本核算；`execId` 幂等去重 |
 | `PortfolioService` | 多币种现金、持仓、买入资金预占、卖出持仓冻结；临界区保证不超卖/不重复占用 |
-| `CorporateActionService` | 拆股、合股、现金分红；按事件 id 幂等 |
-| `ValuationService` | 多币种折算估值；价格/汇率缺失与过期显式标记；固定精度与舍入 |
+| `LotService` | FIFO 成本批次与逐笔已实现盈亏台账；拆/合股同步调整批次；分红独立计当期收益 |
+| `CorporateActionService` | 拆股、合股、现金分红；按事件 id 幂等（同时作用于持仓与批次） |
+| `ValuationService` | 多币种折算估值；价格/汇率缺失与过期显式标记；固定精度与舍入；已实现/未实现盈亏 |
 | `PerformanceService` | 累计收益、年化波动率、最大回撤、95% VaR/ES；样本不足/零波动显式结论 |
 | `BacktestEngine` | 事件驱动编排门面，统一推进事件时间并串联上述服务 |
 
@@ -107,6 +108,64 @@ NEW ──fill──> PARTIALLY_FILLED ──fill──> FILLED   （终态）
 
 ---
 
+## 5A. 持仓批次与已实现盈亏（FIFO，按笔对账）
+
+在原有“单一加权平均成本”之外，新增一层**逐笔成本批次台账**（`LotService`），两套口径并行保留。
+
+### 5A.1 批次口径
+- **每一笔买入成交即开一个独立批次**（`CostLot`）：同一大单被拆成多次部分成交时，
+  每次部分成交各自成批；批次成本 = 成交额 + **该笔买入佣金**（买入费用精确归入对应批次）。
+- **卖出按先进先出（FIFO）消耗批次**：一笔卖出跨多个批次时拆成多行 `LotRealization`，
+  每行记录消耗的批次、数量、成本基础（cost basis）、归属成交额、分摊佣金/税与**已实现盈亏**。
+- 已实现盈亏（金额 2 位、`HALF_UP`）：
+  `realizedPnl = 归属成交额 − 消耗批次成本 − 分摊佣金 − 分摊税`；
+  一笔卖出的佣金/税按各批次成交额占比分摊，**尾批承接全部舍入差**，
+  因此各批次行的成交额/佣金/税/盈亏合计与整笔成交**分毫不差**。
+- 部分消耗批次时，成本按数量比例扣减，剩余成本继续保留在该批次；整批清零时尾差一并出清。
+- 查询入口：`PortfolioService.lotService()`、`BacktestEngine.openLots/realizations/
+  realizedPnl/dividendIncome`，REST 暴露在 `GET /api/positions/{symbol}/lots`
+  与 `GET /api/positions/{symbol}/realizations`。
+
+### 5A.2 公司行为对批次的影响
+- **拆股/合股**：在同一把持仓锁内同时调整加权口径持仓与每个未售尽批次——
+  数量乘 `ratio`、**剩余总成本保持不变**、单位成本等比缩小/放大（8 位展示精度）。
+  随后卖出的已实现盈亏以调整后的批次成本计算，除权前后经济连续。
+- **现金分红**：按**生效时点实际持有数量**计入当期分红收益（按币种累计），
+  **不改动任何批次的数量与剩余成本**，也不计入已实现盈亏；重复事件只计一次。
+
+### 5A.3 估值与对账关系
+- `ValuationResult` 新增（均折算到基础币种，只汇总可可靠折算部分）：
+  `unrealizedPnlBase`（总市值 − 剩余批次成本）、`realizedPnlBase`、`dividendIncomeBase`、
+  `totalPnlBase = realized + unrealized + dividend`；
+  `PositionValuation` 新增每行 `unrealizedPnlBase`。
+- **对账恒等式**（单/多币种分别成立，折算后亦成立）：
+
+  ```
+  期末现金 + 剩余批次成本 = 外部入金累计 + 累计已实现盈亏 + 累计现金分红
+  总收益 = 已实现盈亏 + 未实现盈亏 + 现金分红
+  ```
+
+  买入佣金/滑点体现在剩余成本里（未平仓时表现为浮亏），卖出费用/税直接冲减已实现盈亏，
+  因此费用不漏出恒等式。
+
+### 5A.4 与原“加权平均成本”口径的兼容范围
+- 两套口径**并行**：`Position.avgCost/totalCost`（加权平均，既有 API 与测试不变）
+  与 `LotService` 批次台账（精确对账）。估值的成本与浮盈亏改用**批次口径**，
+  因为它在跨批次部分卖出后仍能与已实现盈亏严格配平；`Position.totalCost` 仅作展示与
+  拆股守恒校验。
+- 两者在“买入费用全部资本化、卖出不改变单位成本”上口径一致，全仓卖出后两者剩余成本都为 0；
+  差异只出现在**跨批次部分卖出后**的单位成本展示（加权平均 vs FIFO 批次）。
+- 买入费用归属从“并入加权均价”细化为“归入具体批次”，使每笔卖出的盈亏可逐笔追溯。
+
+### 5A.5 资金预占与大额单（顺带修复的边界缺陷）
+- 买入结算前，先把该笔实际支出从**本单自己的预占台账**中划出等额预留，
+  使结算的可用资金校验只面对“其他订单的占用”。此前大额单在部分成交续结算时，
+  会把自身仍预占的资金误判为不可用（小金额场景被掩盖，大额必触发 `INSUFFICIENT_FUNDS`）。
+- 部分成交后重校准预占支持**双向**：剩余最坏成本下降则释放差额，上升则补足（补不足仅告警，
+  不擅改订单状态，留待结算硬校验）。
+
+---
+
 ## 6. 估值、多币种折算、精度与舍入
 
 - 舍入统一为 **`RoundingMode.HALF_UP`**：金额 `moneyScale=2` 位；中间量（均价/成本）保留 8 位。
@@ -145,7 +204,7 @@ NEW ──fill──> PARTIALLY_FILLED ──fill──> FILLED   （终态）
 ## 9. 本地验证方法
 
 ```bash
-# 运行全部测试（53 个用例，覆盖部分成交、乱序/缺失行情、重复回报、并发等）
+# 运行全部测试（73 个用例，覆盖部分成交、乱序/缺失行情、重复回报、并发、FIFO 批次与盈亏等）
 mvn test
 
 # 只运行某一类边界测试
@@ -154,19 +213,37 @@ mvn -Dtest=MarketDataEventTimeTest test
 mvn -Dtest=ConcurrencyTest test
 mvn -Dtest=ValuationFxTest test
 
+# 批次与已实现盈亏相关
+mvn -Dtest=LotServiceTest test                  # FIFO 拆批/跨批卖出/费税分摊/拆合股/分红
+mvn -Dtest=LotRealizedPnlIntegrationTest test  # 引擎级对账恒等式、部分卖出、拆股后卖出
+mvn -Dtest=LargeOrderLotFlowTest test          # 大额单：多次部分成交→部分卖出→撤剩余
+mvn -Dtest=ConcurrentLotTradingTest test       # 同标的并发买卖，批次/现金/盈亏一致
+mvn -Dtest=LotCorporateActionTest test         # 拆/合股与分红对批次的影响、重复幂等
+mvn -Dtest=LotMultiCcyAndReplayTest test       # 多币种盈亏折算、同输入重放一致
+
 # 启动服务（可选的 HTTP 通路）
 mvn spring-boot:run
 ```
+
+批次/盈亏的只读查询（REST）：
+`GET /api/positions/{symbol}/lots`（剩余批次：数量、单位成本）、
+`GET /api/positions/{symbol}/realizations`（逐笔卖出的 FIFO 消耗与已实现盈亏）；
+估值结果 `GET /api/valuation` 内含 `unrealizedPnlBase/realizedPnlBase/dividendIncomeBase/totalPnlBase`。
 
 测试以**纯手工装配**（`EngineTestKit`，不依赖 Spring）为主，确定性强；
 另含一个 `@SpringBootTest` 验证容器能正常装配。所有关键判定均通过 SLF4J 打印
 **输入（行情/订单）与判定依据（接受/拒绝原因、成本拆解、资金/持仓余额、估值标志）**。
 
 ### 覆盖的代表性边界
-- 部分成交跨多个 tick 后撤单：现金恰为两笔成交成本之和、预占清零、持仓守恒；
+- 部分成交跨多个 tick 后撤单：现金恰为各笔成交成本之和、预占清零、持仓守恒；
+- **每次部分成交各开一个成本批次；卖出 FIFO 跨批，逐行已实现盈亏（费税分摊、尾批兜舍入差）**；
+- **大额买单多次部分成交 → 部分卖出 → 撤剩余：预占不把自身占用误判为不可用，
+  现金/批次/盈亏严格满足对账恒等式**；
+- **同一标的并发买卖：批次数量之和 == 持仓数量，已实现盈亏 == 各行之和，恒等式在争用下成立**；
 - 乱序/重复/回退行情：floor 视角一致、当前价不回退；
 - 停牌窗口：市价单拒单且资金完好，限价单恢复后续撮合；
-- 重复成交回报（同 `execId`）只入账一次；重复公司行为无副作用；
+- 重复成交回报（同 `execId`）只入账一次；重复公司行为无副作用（批次不二次调整、分红不重复发）；
+- 拆股/合股后批次数量与单位成本同步调整、剩余总成本不变；分红按生效时点数量计一次、批次不动；
 - 汇率缺失/过期、价格缺失/停牌：显式标志，NAV 标 `complete=false`；
 - 32 线程同幂等键只下一单；并发卖出冻结不超卖；并发买入预占不超额；
 - 指标样本不足、零波动、极端下跌：明确结论，无 NaN/Inf。

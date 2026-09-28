@@ -2,7 +2,9 @@ package com.github.highcumontoa.backtestportfolioenginejava.service;
 
 import com.github.highcumontoa.backtestportfolioenginejava.config.CostConfig;
 import com.github.highcumontoa.backtestportfolioenginejava.exception.InvalidArgumentApiException;
+import com.github.highcumontoa.backtestportfolioenginejava.model.CostLot;
 import com.github.highcumontoa.backtestportfolioenginejava.model.Fill;
+import com.github.highcumontoa.backtestportfolioenginejava.model.LotRealization;
 import com.github.highcumontoa.backtestportfolioenginejava.model.Position;
 import com.github.highcumontoa.backtestportfolioenginejava.model.Side;
 import org.slf4j.Logger;
@@ -35,6 +37,7 @@ public class PortfolioService {
     private static final Logger log = LoggerFactory.getLogger(PortfolioService.class);
 
     private final CostConfig config;
+    private final LotService lotService;
     private final ConcurrentMap<String, BigDecimal> cash = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, BigDecimal> reserved = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, Object> cashLocks = new ConcurrentHashMap<>();
@@ -43,11 +46,21 @@ public class PortfolioService {
 
     @Autowired
     public PortfolioService() {
-        this(CostConfig.DEFAULT);
+        this(CostConfig.DEFAULT, new LotService());
     }
 
     public PortfolioService(CostConfig config) {
+        this(config, new LotService());
+    }
+
+    public PortfolioService(CostConfig config, LotService lotService) {
         this.config = config;
+        this.lotService = lotService;
+    }
+
+    /** FIFO 批次与已实现盈亏台账（供公司行为/估值层与查询使用）。 */
+    public LotService lotService() {
+        return lotService;
     }
 
     private Object cashLock(String ccy) {
@@ -191,6 +204,9 @@ public class PortfolioService {
                 Position p = positions.computeIfAbsent(fill.symbol(),
                         s -> new Position(s, currency));
                 p.applyTrade(Side.BUY, fill.quantity(), fill.price(), fill.commission(), fill.tax());
+                // 每笔买入成交（含部分成交）开一个独立成本批次，买入佣金归入批次。
+                lotService.openBuy(fill.symbol(), currency, fill.execId(), fill.eventTime(),
+                        fill.quantity(), fill.price(), nz(fill.commission()));
             }
             log.info("settle BUY symbol={} qty={} px={} out={} ccy={} cashNow={}",
                     fill.symbol(), fill.quantity(), fill.price(), out, currency, cash(currency));
@@ -202,6 +218,9 @@ public class PortfolioService {
                             "sell with no position of " + fill.symbol());
                 }
                 p.applyTrade(Side.SELL, fill.quantity(), fill.price(), fill.commission(), fill.tax());
+                // 按 FIFO 消耗批次，产出逐笔已实现盈亏（佣金/税分摊到批次）。
+                lotService.closeSell(fill.symbol(), currency, fill.execId(), fill.eventTime(),
+                        fill.quantity(), fill.price(), nz(fill.commission()), nz(fill.tax()));
             }
             BigDecimal in = gross.subtract(nz(fill.commission())).subtract(nz(fill.tax()));
             synchronized (cashLock(currency)) {
@@ -214,6 +233,29 @@ public class PortfolioService {
 
     public Position position(String symbol) {
         return positions.get(symbol);
+    }
+
+    /**
+     * 拆股/合股：在持仓锁内同步调整加权口径持仓与 FIFO 批次，
+     * 数量等比变化、单位成本等比缩小，持仓总成本与批次剩余总成本均保持不变。
+     */
+    public void applySplitRatio(String symbol, java.math.BigDecimal ratio) {
+        synchronized (positionLock(symbol)) {
+            Position p = positions.get(symbol);
+            if (p != null) {
+                p.applyRatio(ratio);
+            }
+            lotService.applyRatio(symbol, ratio);
+        }
+    }
+
+    /**
+     * 现金分红入账：增加现金，并按币种计入分红收益（当期收益）；
+     * 不触碰持仓与批次的数量、剩余成本。
+     */
+    public void payDividend(String currency, java.math.BigDecimal amount) {
+        lotService.addDividend(currency, amount);
+        deposit(currency, amount);
     }
 
     public Map<String, Position> positions() {
