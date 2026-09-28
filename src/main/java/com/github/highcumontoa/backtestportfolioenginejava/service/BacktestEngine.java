@@ -219,7 +219,10 @@ public class BacktestEngine {
         }
         Long lastT = lastMatchTime.get(order.getOrderId());
         if (lastT != null && lastT >= t) {
-            return; // 同一（或更早）事件时间已撮合过，防止同 tick 重复成交
+            // 同一（或更早）事件时间已撮合过，防止同 tick 重复成交；
+            // 但成交后的预占校准必须已在成交分支完成，这里不能直接跳过而漏掉校准。
+            recalibrateReservation(order, t);
+            return;
         }
         Optional<Quote> q = marketData.latestAt(order.getSymbol(), t);
         if (q.isEmpty()) {
@@ -244,6 +247,16 @@ public class BacktestEngine {
         portfolio.applyFill(fill, order.getCurrency());
         orderService.applyFill(order.getOrderId(), qty, fill.price(), t);
         lastMatchTime.put(order.getOrderId(), t);
+        // 买入：把本笔实际支出（毛额+佣金+税）从预占划转（实际现金已在 applyFill 扣减），
+        // 台账同步递减，使 reserved 只覆盖“剩余数量的最坏成本”，保证 reserved <= cash。
+        if (order.getSide() == Side.BUY) {
+            BigDecimal settled = fill.price().multiply(fill.quantity())
+                    .add(nz(fill.commission())).add(nz(fill.tax()));
+            portfolio.settleReservedCash(order.getCurrency(), settled);
+            cashReservation.merge(order.getOrderId(), BigDecimal.ZERO,
+                    (held, z) -> held.subtract(settled.min(held)));
+        }
+        // 必须用成交后的最新订单状态判断/校准。
         Order updated = orderService.get(order.getOrderId()).orElseThrow();
         if (updated.getStatus() == com.github.highcumontoa.backtestportfolioenginejava.model.OrderStatus.FILLED) {
             releaseReservation(updated);
@@ -283,8 +296,11 @@ public class BacktestEngine {
     }
 
     /**
-     * 部分成交后重新校准台账：买入按剩余量最坏成本下调现金预占；
-     * 卖出把冻结台账更新为剩余量（实际可卖冻结已在成交时随持仓减少）。
+     * 部分成交后重新校准台账。
+     * 买入：毛成交额已在成交时从预占划转，台账当前覆盖“剩余量最坏成本 + 部分预估费用”，
+     * 这里按剩余量最坏成本重算并只向下释放差额（幂等；重复调用不会多放）；
+     * 价格暂不可得时维持现状等待后续 tick。
+     * 卖出：冻结台账更新为剩余量（实际可卖冻结已在成交时随持仓减少）。
      */
     private void recalibrateReservation(Order order, long t) {
         if (order.getSide() == Side.BUY) {
@@ -328,8 +344,9 @@ public class BacktestEngine {
         if (amount.signum() <= 0) {
             return;
         }
-        BigDecimal held = portfolio.reservedCash(order.getCurrency());
-        portfolio.releaseCash(order.getCurrency(), amount.min(held));
+        // 逐订单台账金额本身就是可信上界（每笔成交只校准一次、终态只释放一次），
+        // 不能与全局 reserved 取 min：大额单下总预占可能高于当前现金，取 min 会漏释放。
+        portfolio.releaseCash(order.getCurrency(), amount);
     }
 
     private List<Order> activeOrders() {
@@ -343,6 +360,10 @@ public class BacktestEngine {
             case FILLED, CANCELLED, REJECTED -> true;
             default -> false;
         };
+    }
+
+    private static BigDecimal nz(BigDecimal v) {
+        return v == null ? BigDecimal.ZERO : v;
     }
 
     /** 按内部 orderId 取订单只读视图（供 REST 层）。 */
@@ -362,5 +383,30 @@ public class BacktestEngine {
                 .orElseThrow(() -> new com.github.highcumontoa.backtestportfolioenginejava.exception
                         .InvalidArgumentApiException("ORDER_NOT_FOUND",
                         "unknown clientOrderId " + clientOrderId));
+    }
+
+    /** 某标的未售完的 FIFO 批次快照。 */
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.LotView>
+            openLots(String symbol) {
+        return portfolio.openLots(symbol);
+    }
+
+    /** 全部标的未售完批次快照。 */
+    public java.util.Map<String,
+            java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.LotView>>
+            allOpenLots() {
+        return portfolio.allOpenLots();
+    }
+
+    /** 逐笔卖出已实现盈亏。 */
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.RealizedPnl>
+            realizedPnls() {
+        return portfolio.realizedPnls();
+    }
+
+    /** 某标的的逐笔已实现盈亏。 */
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.RealizedPnl>
+            realizedPnls(String symbol) {
+        return portfolio.realizedPnls(symbol);
     }
 }

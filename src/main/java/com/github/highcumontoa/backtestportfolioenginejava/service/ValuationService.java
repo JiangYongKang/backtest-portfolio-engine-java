@@ -65,6 +65,7 @@ public class ValuationService {
         List<PositionValuation> stale = new ArrayList<>();
         BigDecimal totalMv = BigDecimal.ZERO.setScale(config.moneyScale(), RoundingMode.HALF_UP);
         BigDecimal totalCost = BigDecimal.ZERO.setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        BigDecimal totalLotCost = BigDecimal.ZERO.setScale(config.moneyScale(), RoundingMode.HALF_UP);
         boolean complete = true;
 
         for (Position p : portfolio.positions().values()) {
@@ -76,6 +77,7 @@ public class ValuationService {
             if (row.flag() == ValuationFlag.OK) {
                 totalMv = totalMv.add(row.marketValueBase());
                 totalCost = totalCost.add(row.costValueBase());
+                totalLotCost = totalLotCost.add(row.lotCostValueBase());
             } else {
                 stale.add(row);
                 complete = false;
@@ -105,11 +107,44 @@ public class ValuationService {
                     amt.multiply(fx.get().rate()).setScale(config.moneyScale(), RoundingMode.HALF_UP));
         }
 
-        BigDecimal totalValueBase = totalMv.add(cashTotalBase);
-        log.info("valuation asOf={} base={} complete={} holdingsMv={} cashBase={} navIncomplete={} staleCount={}",
-                asOfTime, baseCcy, complete, totalMv, cashTotalBase, totalValueBase, stale.size());
+        // 已实现盈亏 / 分红按币种折算；缺汇率或过期同样使 complete=false。
+        BigDecimal realizedBase = BigDecimal.ZERO.setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        for (Map.Entry<String, BigDecimal> e : portfolio.realizedPnlByCurrency().entrySet()) {
+            Optional<FxRate> fx = fxRates.latestAt(e.getKey(), baseCcy, asOfTime);
+            if (fx.isEmpty() || isStaleFx(fx.get(), asOfTime)) {
+                complete = false;
+                log.warn("valuation realized-pnl fx unavailable ccy={} base={} t={}",
+                        e.getKey(), baseCcy, asOfTime);
+                continue;
+            }
+            realizedBase = realizedBase.add(
+                    e.getValue().multiply(fx.get().rate()).setScale(config.moneyScale(), RoundingMode.HALF_UP));
+        }
+        BigDecimal dividendBase = BigDecimal.ZERO.setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        for (Map.Entry<String, BigDecimal> e : portfolio.dividendsByCurrency().entrySet()) {
+            Optional<FxRate> fx = fxRates.latestAt(e.getKey(), baseCcy, asOfTime);
+            if (fx.isEmpty() || isStaleFx(fx.get(), asOfTime)) {
+                complete = false;
+                log.warn("valuation dividend fx unavailable ccy={} base={} t={}",
+                        e.getKey(), baseCcy, asOfTime);
+                continue;
+            }
+            dividendBase = dividendBase.add(
+                    e.getValue().multiply(fx.get().rate()).setScale(config.moneyScale(), RoundingMode.HALF_UP));
+        }
+
+        BigDecimal unrealizedBase = totalMv.subtract(totalLotCost)
+                .setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        BigDecimal totalPnlBase = realizedBase.add(unrealizedBase).add(dividendBase)
+                .setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        BigDecimal navBase = totalMv.add(cashTotalBase)
+                .setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        log.info("valuation asOf={} base={} complete={} holdingsMv={} lotCost={} unreal={} realized={} div={} cashBase={} nav={} staleCount={}",
+                asOfTime, baseCcy, complete, totalMv, totalLotCost, unrealizedBase,
+                realizedBase, dividendBase, cashTotalBase, navBase, stale.size());
         return new ValuationResult(asOfTime, baseCcy, cashBase, rows,
-                totalMv, totalCost, complete, List.copyOf(stale));
+                totalMv, totalCost, totalLotCost, unrealizedBase, realizedBase,
+                dividendBase, totalPnlBase, cashTotalBase, navBase, complete, List.copyOf(stale));
     }
 
     private PositionValuation valuePosition(Position p, long asOfTime, String baseCcy) {
@@ -143,8 +178,15 @@ public class ValuationService {
         BigDecimal mvBase = mvLocal.multiply(fxRate).setScale(config.moneyScale(), RoundingMode.HALF_UP);
         BigDecimal costBase = p.totalCost().multiply(fxRate)
                 .setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        // 批次台账口径：剩余成本与持仓数量必须一致（同一标的锁内成对更新）。
+        BigDecimal lotCostLocal = portfolio.lotRemainingCost(symbol);
+        BigDecimal lotCostBase = lotCostLocal.multiply(fxRate)
+                .setScale(config.moneyScale(), RoundingMode.HALF_UP);
+        BigDecimal unrealizedBase = mvBase.subtract(lotCostBase)
+                .setScale(config.moneyScale(), RoundingMode.HALF_UP);
         return new PositionValuation(symbol, p.getQuantity(), quote.last(), quote.eventTime(),
-                ccy, fxRate, fx.get().eventTime(), mvBase, costBase, ValuationFlag.OK, "ok");
+                ccy, fxRate, fx.get().eventTime(), mvBase, costBase, lotCostBase,
+                unrealizedBase, ValuationFlag.OK, "ok");
     }
 
     private boolean isStaleFx(FxRate fx, long asOfTime) {
@@ -156,6 +198,6 @@ public class ValuationService {
                                   BigDecimal fx, Long fxTime, ValuationFlag flag, String detail) {
         return new PositionValuation(p.getSymbol(), p.getQuantity(), price,
                 priceTime == null ? 0L : priceTime, p.getCurrency(),
-                fx, fxTime, null, null, flag, detail);
+                fx, fxTime, null, null, null, null, flag, detail);
     }
 }

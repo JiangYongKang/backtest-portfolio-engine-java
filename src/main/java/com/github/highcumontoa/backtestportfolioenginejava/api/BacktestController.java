@@ -73,4 +73,25 @@ public class BacktestController {
     public ValuationResult valuation(@RequestParam long asOf, @RequestParam String baseCcy) {
         return engine.runTo(asOf, baseCcy);
     }
+
+    /** 某标的未售完的 FIFO 批次（数量、剩余成本、单位成本）。 */
+    @GetMapping("/positions/{symbol}/lots")
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.LotView>
+            lots(@PathVariable String symbol) {
+        return engine.openLots(symbol);
+    }
+
+    /** 全部标的未售完批次。 */
+    @GetMapping("/lots")
+    public java.util.Map<String,
+            java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.LotView>> allLots() {
+        return engine.allOpenLots();
+    }
+
+    /** 逐笔卖出的已实现盈亏（FIFO 明细、佣金、税）。 */
+    @GetMapping("/realized-pnl")
+    public java.util.List<com.github.highcumontoa.backtestportfolioenginejava.model.lot.RealizedPnl>
+            realizedPnl(@RequestParam(required = false) String symbol) {
+        return symbol == null ? engine.realizedPnls() : engine.realizedPnls(symbol);
+    }
 }

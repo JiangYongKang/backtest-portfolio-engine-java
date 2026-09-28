@@ -47,24 +47,32 @@ public class CorporateActionService {
             BigDecimal qty = p == null ? BigDecimal.ZERO : p.getQuantity();
             BigDecimal proceeds = qty.multiply(action.cashPerShare())
                     .setScale(portfolio.getConfig().moneyScale(), java.math.RoundingMode.HALF_UP);
-            // 直接派现（入账为内部公司行为，非外部入金）。
-            portfolio.deposit(action.currency(), proceeds);
+            // 直接派现：计入当期分红收益（现金增加），不改动批次数量与剩余成本。
+            portfolio.payDividend(action.currency(), proceeds);
             log.info("corporate action CASH_DIVIDEND id={} symbol={} qty={} perShare={} proceeds={} {}",
                     action.id(), action.symbol(), qty, action.cashPerShare(), proceeds, action.currency());
             return true;
         }
-        // 拆股 / 合股
+        // 拆股 / 合股：Position（数量/均价）与批次（数量、成本池不动）在同一标的锁内成对调整，
+        // 保证两边看到的数量始终一致；批次口径总剩余成本调整前后保持不变。
         if (p == null) {
             log.info("corporate action {} id={} symbol={} no position, nothing to adjust",
                     action.type(), action.id(), action.symbol());
             return true;
         }
-        BigDecimal beforeQty = p.getQuantity();
-        BigDecimal beforeCost = p.totalCost();
-        p.applyRatio(action.ratio());
-        log.info("corporate action {} id={} symbol={} ratio={} qty {} -> {} totalCost {} -> {}",
+        BigDecimal beforeQty;
+        BigDecimal beforePosCost;
+        BigDecimal beforeLotCost;
+        synchronized (portfolio.positionLock(action.symbol())) {
+            beforeQty = p.getQuantity();
+            beforePosCost = p.totalCost();
+            beforeLotCost = portfolio.lotRemainingCost(action.symbol());
+            p.applyRatio(action.ratio());
+            portfolio.adjustLotsForRatio(action.symbol(), action.ratio());
+        }
+        log.info("corporate action {} id={} symbol={} ratio={} qty {} -> {} posCost {} lotCost {} -> {}",
                 action.type(), action.id(), action.symbol(), action.ratio(),
-                beforeQty, p.getQuantity(), beforeCost, p.totalCost());
+                beforeQty, p.getQuantity(), beforePosCost, beforeLotCost);
         return true;
     }
 
