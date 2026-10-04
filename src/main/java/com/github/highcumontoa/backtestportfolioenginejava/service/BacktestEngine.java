@@ -26,7 +26,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>下单时点按最坏情形预占买入资金（金额按限价/当刻价 + 预估费用）或冻结卖出持仓。</li>
  *   <li>每个行情时点尝试撮合所有在途订单；市价/限价由 {@link MatchingService} 判定，
  *       停牌/无价不成交，后续行情恢复后可续撮合（支持部分成交）。</li>
- *   <li>成交生成唯一 execId，经 FillService 幂等后结算到组合；订单全部成交自动释放尾量预占。</li>
+ *   <li>成交生成唯一 execId，经 FillService 幂等后结算到组合；每笔买入成交（含部分成交）
+ *       先把本笔实际支出从本单自己的预占中划出，再把预占台账重校准为“仅覆盖剩余量的最坏成本”，
+ *       已成交部分当场让出占用、立即可用于后续新单；订单全部成交自动释放尾量预占。</li>
  *   <li>撤单释放未用预占/冻结；runTo 结束仍未成交的市价单被拒（MARKET_CLOSED 语义），
  *       限价单保持在途等待下一次 runTo（GTC）。</li>
  * </ol>
@@ -167,7 +169,7 @@ public class BacktestEngine {
                 orderService.reject(order.getOrderId(), RejectReason.MARKET_CLOSED, t);
                 return;
             }
-            BigDecimal estCost = estimateCost(order, px);
+            BigDecimal estCost = estimateCost(order, order.getQuantity(), px);
             try {
                 portfolio.reserveCash(ccy, estCost);
                 cashReservation.put(order.getOrderId(), estCost);
@@ -308,9 +310,13 @@ public class BacktestEngine {
      * 限价单用限价作为参考价，再按买入滑点上浮并计入佣金/税——成交价含滑点可能高于限价，
      * 预占必须覆盖这部分上浮，否则部分成交续结算时可用资金会被滑点“挤爆”。
      * 市价单用当刻可见参考价，滑点同理计入。
+     *
+     * <p>{@code qty} 为要覆盖的数量：下单时传整单量；部分成交后重校准必须传
+     * <b>剩余量</b>（{@link Order#remainingQty()}），使预占随剩余量同步下降，
+     * 已成交部分当场把占用让出来。
      */
-    private BigDecimal estimateCost(Order order, BigDecimal px) {
-        var cb = fillService.computeCosts(order, order.getQuantity(), px);
+    private BigDecimal estimateCost(Order order, BigDecimal qty, BigDecimal px) {
+        var cb = fillService.computeCosts(order, qty, px);
         return cb.netCashFlow().abs();
     }
 
@@ -330,7 +336,7 @@ public class BacktestEngine {
             if (px == null) {
                 return; // 价格暂不可得，维持预占等待后续
             }
-            BigDecimal need = estimateCost(order, px);
+            BigDecimal need = estimateCost(order, order.remainingQty(), px);
             int cmp = need.compareTo(held);
             if (cmp < 0) {
                 // 剩余量最坏成本下降：释放差额。

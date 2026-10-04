@@ -1,0 +1,21 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 业务测试日志：用例内以 [业务N-...] 前缀打印覆盖的业务点与用例结论，保持 INFO 可见 -->
+    <logger name="com.github.highcumontoa.backtestportfolioenginejava.tests" level="INFO"/>
+
+    <!-- 被测引擎链路保留关键节点（下单/成交/结算/占用/估值），降噪但仍可追踪资金动作 -->
+    <logger name="com.github.highcumontoa.backtestportfolioenginejava.service" level="INFO"/>
+
+    <!-- Spring/第三方框架在单测中的装配噪音压到 WARN -->
+    <logger name="org.springframework" level="WARN"/>
+    <logger name="org.apache" level="WARN"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

@@ -17,17 +17,26 @@ final class EngineTestKit {
     final MarketDataService marketData = new MarketDataService();
     final FxRateService fxRates = new FxRateService();
     final OrderService orderService = new OrderService();
-    final CostConfig config = CostConfig.DEFAULT;
-    final MatchingService matching = new MatchingService(config);
-    final FillService fillService = new FillService(config);
-    final PortfolioService portfolio = new PortfolioService(config);
+    final CostConfig config;
+    final MatchingService matching;
+    final FillService fillService;
+    final PortfolioService portfolio;
     final CorporateActionService corporateActionService;
     final ValuationService valuationService;
     final BacktestEngine engine;
 
     EngineTestKit() {
+        this(CostConfig.DEFAULT);
+    }
+
+    /** 使用指定成本配置手工装配（如零最低佣金，使部分成交占用金额随数量完全线性）。 */
+    EngineTestKit(CostConfig customConfig) {
+        this.config = customConfig;
+        this.matching = new MatchingService(customConfig);
+        this.fillService = new FillService(customConfig);
+        this.portfolio = new PortfolioService(customConfig);
         corporateActionService = new CorporateActionService(portfolio);
-        valuationService = new ValuationService(marketData, fxRates, portfolio, config);
+        valuationService = new ValuationService(marketData, fxRates, portfolio, customConfig);
         engine = new BacktestEngine(marketData, fxRates, orderService, matching,
                 fillService, portfolio, corporateActionService, valuationService);
     }
