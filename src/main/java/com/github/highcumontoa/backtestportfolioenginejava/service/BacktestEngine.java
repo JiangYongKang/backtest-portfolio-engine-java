@@ -26,7 +26,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>下单时点按最坏情形预占买入资金（金额按限价/当刻价 + 预估费用）或冻结卖出持仓。</li>
  *   <li>每个行情时点尝试撮合所有在途订单；市价/限价由 {@link MatchingService} 判定，
  *       停牌/无价不成交，后续行情恢复后可续撮合（支持部分成交）。</li>
- *   <li>成交生成唯一 execId，经 FillService 幂等后结算到组合；订单全部成交自动释放尾量预占。</li>
+ *   <li>成交生成唯一 execId，经 FillService 幂等后结算到组合；每笔成交先从本单台账划出等额预留再结算，
+ *       随后按“剩余未成交量”重校准最坏占用——已成交部分（含价差/滑点缓冲）当场退出，
+ *       减出来的钱立即可用于新单；订单全部成交或撤单时剩余预占一次清零。</li>
  *   <li>撤单释放未用预占/冻结；runTo 结束仍未成交的市价单被拒（MARKET_CLOSED 语义），
  *       限价单保持在途等待下一次 runTo（GTC）。</li>
  * </ol>
@@ -315,7 +317,17 @@ public class BacktestEngine {
     }
 
     /**
-     * 部分成交后重新校准台账：买入按剩余量最坏成本下调现金预占；
+     * 剩余未成交数量的最坏成本（部分成交后重校准用）。
+     * 注意只能用 {@link Order#remainingQty()}；若误用原始总量，已成交部分的缓冲退不出来，
+     * 会把大额单的占用一直压在整单量级（本 bug 的根因）。
+     */
+    private BigDecimal estimateRemainingCost(Order order, BigDecimal px) {
+        var cb = fillService.computeCosts(order, order.remainingQty(), px);
+        return cb.netCashFlow().abs();
+    }
+
+    /**
+     * 部分成交后重新校准台账：买入按“剩余未成交量”的最坏成本下调现金预占；
      * 卖出把冻结台账更新为剩余量（实际可卖冻结已在成交时随持仓减少）。
      */
     private void recalibrateReservation(Order order, long t) {
@@ -330,7 +342,10 @@ public class BacktestEngine {
             if (px == null) {
                 return; // 价格暂不可得，维持预占等待后续
             }
-            BigDecimal need = estimateCost(order, px);
+            // 关键：按“剩余未成交数量”重估最坏成本，而不是订单原始总量。
+            // 已成交部分的价差/滑点缓冲在成交当时就该退出占用，否则大额单部分成交后
+            // 总占用会一直压在接近整单金额，挤出本可用于新单的可用资金。
+            BigDecimal need = estimateRemainingCost(order, px);
             int cmp = need.compareTo(held);
             if (cmp < 0) {
                 // 剩余量最坏成本下降：释放差额。
